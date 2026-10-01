@@ -8,6 +8,8 @@ Endpoints:
     POST /v1/rulesets/{name}/revisions
     GET  /v1/rulesets/{name}/revisions
     POST /v1/rulesets/{name}/revisions/{revision}/activate
+    POST /v1/rulesets/{name}/revisions/{revision}/impact-review
+         (read-only pre-publication impact review over an assessment batch)
     POST /v1/assessments
     GET  /v1/assessments/{id}
     POST /v1/assessments/{id}/confirm
@@ -32,6 +34,7 @@ from .fulfillment import UnprocessableError, check_fulfillment
 from .remediation import RemediationConflict, plan_remediation
 from .responsibility import PartialPlanError, build_plan
 from .revisions import REVISION_ID_LEN
+from .review import build_impact_report, validate_review_body
 from .rules import validate_ruleset
 from .schedule import build_schedule
 from .solver import assess_normalized, build_confirmation, normalize_request
@@ -40,7 +43,7 @@ MAX_BODY_BYTES = 16 * 1024 * 1024
 _NAME_RE = re.compile(r"^/v1/rulesets(?:/([A-Za-z0-9._-]{1,64}))?$")
 _REVISION_RE = re.compile(
     r"^/v1/rulesets/([A-Za-z0-9._-]{1,64})/revisions"
-    r"(?:/([0-9a-f]{%d})(/activate)?)?$" % REVISION_ID_LEN
+    r"(?:/([0-9a-f]{%d})(/(?:activate|impact-review))?)?$" % REVISION_ID_LEN
 )
 _ASSESS_RE = re.compile(
     r"^/v1/assessments(?:/([0-9a-f]{8,64})"
@@ -123,6 +126,25 @@ class Api:
         if history is None:
             raise NotFound("ruleset %r not found" % name)
         return history
+
+    def impact_review(self, name, target_revision, body):
+        """Pre-publication review of a target revision over a batch.
+
+        The envelope (base revision + 1..50 unique assessment ids) is
+        validated here; every stateful precondition (the base revision
+        still being active, the target revision existing, each assessment
+        belonging to the ruleset and recording that active revision) is
+        confirmed by the store in a single read transaction, which either
+        yields the whole batch or raises ConflictError -- never a partial
+        report.
+        """
+        base_revision, ids = validate_review_body(body)
+        target_rules, rows = self.store.review_impact_inputs(
+            name, target_revision, base_revision, ids
+        )
+        return build_impact_report(
+            name, target_revision, base_revision, rows, target_rules
+        )
 
     # -- assessments ------------------------------------------------------
 
@@ -396,6 +418,7 @@ def make_server(host, port, store):
                                 "POST /v1/rulesets/{name}/revisions",
                                 "GET  /v1/rulesets/{name}/revisions",
                                 "POST /v1/rulesets/{name}/revisions/{revision}/activate",
+                                "POST /v1/rulesets/{name}/revisions/{revision}/impact-review",
                                 "POST /v1/assessments",
                                 "GET  /v1/assessments/{id}",
                                 "POST /v1/assessments/{id}/confirm",
@@ -422,6 +445,10 @@ def make_server(host, port, store):
                     if method == "POST" and rev is not None and activate == "/activate":
                         return self._json(
                             200, api.activate_revision(rname, rev, self._body())
+                        )
+                    if method == "POST" and rev is not None and activate == "/impact-review":
+                        return self._json(
+                            200, api.impact_review(rname, rev, self._body())
                         )
 
                 m = _NAME_RE.match(path)

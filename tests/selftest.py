@@ -411,6 +411,9 @@ def run_checks():
     # -- immutable revisions, atomic activation, rollback & concurrency ------
     run_revision_checks()
 
+    # -- pre-publication impact review --------------------------------------
+    run_impact_review_checks()
+
     # -- WITH exception removes propagation ----------------------------------
     exc_request = {
         "components": [
@@ -3227,6 +3230,467 @@ def run_revision_fresh_db_checks():
         and len(hist["activations"]) == 3
         and hist["active_revision"] == rid,
     )
+
+
+def run_impact_review_checks():
+    """Exercise the pre-publication impact review end to end.
+
+    A dedicated ruleset (active r1) backs four assessments: one ok item
+    that the target revision turns into a conflict (newly incompatible
+    licenses), one ok item it turns into a missing-rules error (the
+    license rule is deleted), one item already conflicting that stays a
+    conflict, plus a foreign-ruleset/inline assessment for rejection.
+    The checks cover: report ordering and per-item old/new projection,
+    the release->conflict/error summary, request-order invariance of the
+    report_hash, envelope 400s (missing fields, 1..50 bounds, duplicate
+    and non-string ids), whole-batch 409s (stale baseline, unknown target
+    revision, unknown ruleset, unknown/foreign/mismatched-revision
+    assessments, null-baseline handling for draft-only rulesets),
+    read-transaction behavior under a real activation race, absence of
+    side effects, and reviewing the already-active revision.
+    """
+    v1 = {
+        "licenses": {
+            "P-1.0": {"obligations": ["attribution"]},
+            "F-1.0": {
+                "obligations": ["attribution", "source-offer", "same-license"],
+                "propagates": ["static"],
+            },
+            "Q-1.0": {"obligations": ["attribution"]},
+            "X-1.0": {
+                "obligations": ["attribution"],
+                "incompatible_with": ["Y-1.0"],
+            },
+            "Y-1.0": {"obligations": ["attribution"]},
+        }
+    }
+    # target draft: P/F become incompatible (A -> conflict), Q disappears
+    # (B -> missing-rules); X/Y keep clashing (C stays conflict).
+    v2 = {
+        "licenses": {
+            "P-1.0": {
+                "obligations": ["attribution"],
+                "incompatible_with": ["F-1.0"],
+            },
+            "F-1.0": {
+                "obligations": ["attribution", "source-offer", "same-license"],
+                "propagates": ["static"],
+            },
+            "X-1.0": {
+                "obligations": ["attribution"],
+                "incompatible_with": ["Y-1.0"],
+            },
+            "Y-1.0": {"obligations": ["attribution"]},
+        }
+    }
+    v3 = {
+        "licenses": dict(
+            v1["licenses"],
+            **{"P-1.0": {"obligations": ["attribution", "license-text"]}},
+        )
+    }
+
+    code, body = call("PUT", "/v1/rulesets/impact", v1)
+    check("impact: ruleset published", code == 200 and body.get("created") is True)
+    r1 = call("GET", "/v1/rulesets/impact")[1]["active_revision"]
+
+    def assess(spec):
+        code, out = call("POST", "/v1/assessments",
+                         dict({"ruleset": "impact"}, **spec))
+        check("impact: assessment accepted (%s)" % spec["product"], code == 200,
+              json.dumps(out)[:160])
+        return out
+
+    a_ok = assess({
+        "product": "a-ok",
+        "components": [
+            {"id": "app", "license": "P-1.0"},
+            {"id": "libf", "license": "F-1.0", "linkage": "dynamic"},
+        ],
+        "dependencies": [{"from": "app", "to": "libf"}],
+    })
+    aid_ok = a_ok["id"]
+    check(
+        "impact: baseline item A is ok",
+        a_ok["result"]["status"] == "ok"
+        and set(a_ok["result"]["artifact_obligations"])
+        == {"attribution", "source-offer", "same-license"}
+        and a_ok["result"]["adopted"]["libf"] == "F-1.0",
+    )
+
+    b_missing = assess({
+        "product": "b-missing",
+        "components": [{"id": "q", "license": "Q-1.0"}],
+    })
+    aid_missing = b_missing["id"]
+    check("impact: baseline item B is ok", b_missing["result"]["status"] == "ok")
+
+    c_conflict = assess({
+        "product": "c-conflict",
+        "components": [
+            {"id": "app", "license": "P-1.0"},
+            {"id": "x", "license": "X-1.0", "linkage": "static"},
+            {"id": "y", "license": "Y-1.0", "linkage": "static"},
+        ],
+        "dependencies": [
+            {"from": "app", "to": "x"},
+            {"from": "app", "to": "y"},
+        ],
+    })
+    aid_conflict = c_conflict["id"]
+    check("impact: baseline item C is conflict",
+          c_conflict["result"]["status"] == "conflict")
+
+    # target draft r2 based on r1 (stays a draft, never activated)
+    code, body = call("POST", "/v1/rulesets/impact/revisions",
+                      {"rules": v2, "base_revision": r1})
+    r2 = body.get("revision")
+    check("impact: target revision drafted",
+          code == 200 and body.get("active") is False and r2 != r1)
+
+    def review(ids, base=r1, target=r2, ruleset="impact"):
+        return call(
+            "POST",
+            "/v1/rulesets/%s/revisions/%s/impact-review" % (ruleset, target),
+            {"base_revision": base, "assessment_ids": ids},
+        )
+
+    # -- envelope 400s -------------------------------------------------------
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"assessment_ids": [aid_ok]})
+    check("impact: missing base_revision -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"base_revision": 7, "assessment_ids": [aid_ok]})
+    check("impact: non-string base_revision -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"base_revision": r1})
+    check("impact: missing assessment_ids -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"base_revision": r1, "assessment_ids": []})
+    check("impact: empty assessment_ids -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"base_revision": r1, "assessment_ids": "nope"})
+    check("impact: non-array assessment_ids -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"base_revision": r1, "assessment_ids": [aid_ok, aid_ok]})
+    check("impact: duplicate assessment id -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"base_revision": r1, "assessment_ids": [42]})
+    check("impact: non-string assessment id -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        ["not", "an", "object"])
+    check("impact: non-object body -> 400", code == 400)
+
+    # 50 ids are accepted; 51 fail the envelope before any state check
+    fifty = []
+    for i in range(50):
+        out = assess({
+            "product": "bulk-%02d" % i,
+            "components": [{"id": "c%02d" % i, "license": "P-1.0"}],
+        })
+        fifty.append(out["id"])
+    code, bulk = review(fifty)
+    check(
+        "impact: batch of 50 accepted",
+        code == 200 and bulk.get("assessed_count") == 50
+        and [it["assessment_id"] for it in bulk["items"]] == sorted(fifty),
+    )
+    code, body = review(fifty + ["deadbeef" * 4])
+    check("impact: batch of 51 -> 400 (no state evaluation)", code == 400)
+
+    # -- happy-path report ---------------------------------------------------
+    batch = [aid_conflict, aid_missing, aid_ok]
+    code, rep = review(batch)
+    check("impact: mixed batch 200", code == 200, json.dumps(rep)[:200])
+    items = rep.get("items", [])
+    check(
+        "impact: items sorted by assessment id",
+        [it["assessment_id"] for it in items] == sorted(batch),
+    )
+    check(
+        "impact: header fields",
+        rep.get("ruleset") == "impact"
+        and rep.get("target_revision") == r2
+        and rep.get("base_revision") == r1
+        and rep.get("assessed_count") == 3
+        and len(rep.get("report_hash", "")) == 64,
+    )
+    by_id = {it["assessment_id"]: it for it in items}
+
+    it = by_id[aid_ok]
+    check(
+        "impact: ok->conflict regression projected",
+        it["old_status"] == "ok" and it["new_status"] == "conflict"
+        and it["old_summary_hash"] == a_ok["result"]["summary_hash"]
+        and it["new_summary_hash"] != it["old_summary_hash"]
+        and it["old_adopted"] == a_ok["result"]["adopted"]
+        and it["new_adopted"] is None
+        and it["regressed"] is True,
+        json.dumps(it)[:300],
+    )
+    od = it["obligation_diff"]
+    check(
+        "impact: obligation diff on regression",
+        set(od["artifact_obligations"]["removed"])
+        == {"attribution", "source-offer", "same-license"}
+        and od["artifact_obligations"]["added"] == []
+        and {d["component"] for d in od["components"]} == {"app", "libf"},
+        json.dumps(od)[:300],
+    )
+
+    it = by_id[aid_missing]
+    check(
+        "impact: ok->missing-rules regression projected",
+        it["old_status"] == "ok" and it["new_status"] == "missing-rules"
+        and it["old_adopted"] is not None and it["new_adopted"] is None
+        and it["regressed"] is True,
+    )
+
+    it = by_id[aid_conflict]
+    check(
+        "impact: conflict->conflict is not a regression",
+        it["old_status"] == "conflict" and it["new_status"] == "conflict"
+        and it["old_adopted"] is None and it["new_adopted"] is None
+        and it["regressed"] is False
+        and it["new_summary_hash"] == it["old_summary_hash"],
+    )
+
+    summary = rep["summary"]
+    check(
+        "impact: regression summary",
+        summary["release_to_conflict"] == [aid_ok]
+        and summary["release_to_error"] == [aid_missing]
+        and summary["release_to_conflict_or_error"]
+        == sorted([aid_ok, aid_missing])
+        and summary["release_to_conflict_or_error_count"] == 2,
+        json.dumps(summary)[:300],
+    )
+    transitions = {(c["from"], c["to"]): c["count"]
+                    for c in summary["status_changes"]}
+    check(
+        "impact: status change counters",
+        transitions == {("ok", "conflict"): 1, ("ok", "missing-rules"): 1}
+        and summary["status_changed_count"] == 2,
+    )
+
+    # each new result is exactly the target-snapshot re-evaluation
+    for aid, label in (
+        (aid_ok, "a-ok"),
+        (aid_missing, "b-missing"),
+        (aid_conflict, "c-conflict"),
+    ):
+        row = call("GET", "/v1/assessments/" + aid)[1]
+        recomputed = assess_normalized(row["request"], validate_ruleset(v2))
+        check(
+            "impact: new_summary_hash matches independent re-evaluation (%s)"
+            % label,
+            by_id[aid]["new_summary_hash"] == recomputed["summary_hash"]
+            and by_id[aid]["new_status"] == recomputed["status"],
+        )
+
+    # request ordering must not change the report
+    code, rep_rev = review(list(reversed(batch)))
+    check(
+        "impact: request order does not change report/hash",
+        code == 200 and rep_rev["report_hash"] == rep["report_hash"]
+        and [i["assessment_id"] for i in rep_rev["items"]]
+        == [i["assessment_id"] for i in rep["items"]],
+    )
+    code, rep_again = review(batch)
+    check(
+        "impact: repeat review is byte-stable",
+        code == 200 and json.dumps(rep_again, sort_keys=True)
+        == json.dumps(rep, sort_keys=True),
+    )
+
+    # -- whole-batch 409s, no partial reports --------------------------------
+    code, body = review([aid_ok], base="0" * 16)
+    check(
+        "impact: stale baseline -> 409 active-moved",
+        code == 409 and body.get("reason") == "active-moved"
+        and body.get("base_revision") == "0" * 16
+        and body.get("active_revision") == r1,
+        json.dumps(body)[:200],
+    )
+    code, body = review([aid_ok], base=None)
+    check("impact: null baseline against active ruleset -> 409",
+          code == 409 and body.get("reason") == "active-moved")
+    code, body = review([aid_ok], target="a" * 16)
+    check(
+        "impact: unknown target revision -> 409",
+        code == 409 and body.get("reason") == "unknown-target-revision"
+        and body.get("active_revision") == r1,
+    )
+    code, body = review(
+        [aid_ok], target="0" * 16, ruleset="impact-never-existed"
+    )
+    check("impact: unknown ruleset -> 409 ruleset-not-found",
+          code == 409 and body.get("reason") == "ruleset-not-found")
+    code, body = review(["1" * 32])
+    check(
+        "impact: unknown assessment -> 409 assessment-not-found",
+        code == 409 and body.get("reason") == "assessment-not-found"
+        and body.get("assessment_ids") == ["1" * 32],
+    )
+    code, body = review(["z" * 32, "a" * 32])
+    check(
+        "impact: unknown ids reported deterministically (sorted)",
+        code == 409 and body.get("assessment_ids") == ["a" * 32, "z" * 32],
+    )
+    # one bad id poisons the whole batch; no partial report exists
+    code, body = review([aid_ok, "2" * 32, aid_missing])
+    check("impact: one unknown id fails the whole batch",
+          code == 409 and body.get("reason") == "assessment-not-found"
+          and body.get("assessment_ids") == ["2" * 32])
+    code, clean = review([aid_ok, aid_missing])
+    check(
+        "impact: clean batch after refused batch still reports",
+        code == 200 and clean["assessed_count"] == 2
+        and {i["assessment_id"] for i in clean["items"]}
+        == {aid_ok, aid_missing}
+        and {i["new_summary_hash"] for i in clean["items"]}
+        == {i["new_summary_hash"] for i in rep["items"]
+            if i["assessment_id"] in (aid_ok, aid_missing)},
+    )
+
+    # foreign ruleset assessment
+    call("PUT", "/v1/rulesets/impact-other",
+         {"licenses": {"O-1.0": {"obligations": ["attribution"]}}})
+    foreign = call("POST", "/v1/assessments", {
+        "product": "foreign", "ruleset": "impact-other",
+        "components": [{"id": "o", "license": "O-1.0"}]})[1]
+    code, body = review([aid_ok, foreign["id"]])
+    check(
+        "impact: foreign-ruleset assessment -> 409 whole batch",
+        code == 409 and body.get("reason") == "assessment-ruleset-mismatch"
+        and body.get("ruleset") == "impact"
+        and body.get("assessment_ids") == [foreign["id"]],
+        json.dumps(body)[:200],
+    )
+    # inline-rule assessments belong to no ruleset and are refused too
+    inline = call("POST", "/v1/assessments", {
+        "product": "inline",
+        "rules": {"licenses": {"I-1.0": {"obligations": ["attribution"]}}},
+        "components": [{"id": "i", "license": "I-1.0"}]})[1]
+    code, body = review([inline["id"]])
+    check("impact: inline-rule assessment -> 409",
+          code == 409 and body.get("reason") == "assessment-ruleset-mismatch")
+
+    # -- revision mismatch after activation/rollback -------------------------
+    code, body = call("POST", "/v1/rulesets/impact/revisions",
+                      {"rules": v3, "base_revision": r1})
+    r3 = body["revision"]
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/activate" % r3,
+        {"expected_active_revision": r1})
+    check("impact: r3 activated for mismatch scenario", code == 200)
+    aid_r3 = assess({"product": "on-r3",
+                     "components": [{"id": "p3", "license": "P-1.0"}]})
+    check("impact: new assessment records r3",
+          aid_r3.get("ruleset_revision") == r3)
+    # roll back to r1: the r3-recorded assessment is now on the wrong revision
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/activate" % r1,
+        {"expected_active_revision": r3})
+    check("impact: rolled back to r1", code == 200)
+    code, body = review([aid_ok, aid_r3["id"]])
+    check(
+        "impact: assessment recorded against another revision -> 409",
+        code == 409 and body.get("reason") == "assessment-revision-mismatch"
+        and body.get("active_revision") == r1
+        and body.get("assessment_ids") == [aid_r3["id"]],
+        json.dumps(body)[:200],
+    )
+    code, body = review([aid_r3["id"]], base=r3, target=r3)
+    check("impact: review prepared at r3 after rollback -> active-moved",
+          code == 409 and body.get("reason") == "active-moved"
+          and body.get("active_revision") == r1)
+
+    # draft-only ruleset: null baseline passes the active-match stage; a
+    # nonexistent id then fails at assessment lookup (not at the baseline)
+    code, body = call("POST", "/v1/rulesets/impact-draft/revisions",
+                      {"rules": {"licenses": {"S-1.0": {}}},
+                       "base_revision": None})
+    rdraft = body["revision"]
+    code, body = call(
+        "POST",
+        "/v1/rulesets/impact-draft/revisions/%s/impact-review" % rdraft,
+        {"base_revision": None, "assessment_ids": ["9" * 32]})
+    check(
+        "impact: draft-only ruleset accepts null baseline, then 409 on id",
+        code == 409 and body.get("reason") == "assessment-not-found",
+        json.dumps(body)[:160],
+    )
+
+    # reviewing the already-active revision against itself changes nothing
+    code, self_rep = review([aid_ok], target=r1)
+    sit = {i["assessment_id"]: i for i in self_rep["items"]}[aid_ok]
+    check(
+        "impact: reviewing active revision against itself is a no-op diff",
+        code == 200 and sit["old_status"] == sit["new_status"]
+        and sit["old_summary_hash"] == sit["new_summary_hash"]
+        and sit["regressed"] is False
+        and self_rep["summary"]["status_changed_count"] == 0,
+    )
+
+    # -- read-only: review never mutates persisted state ---------------------
+    row = call("GET", "/v1/assessments/" + aid_ok)[1]
+    check(
+        "impact: review does not mutate the assessment",
+        row["revision"] == r1
+        and row["result"]["summary_hash"] == a_ok["result"]["summary_hash"],
+    )
+    hist = call("GET", "/v1/rulesets/impact/revisions")[1]
+    check(
+        "impact: review creates no revisions or activations",
+        [r["revision"] for r in hist["revisions"]] == [r1, r2, r3]
+        and hist["active_revision"] == r1,
+    )
+
+    # -- real race: reviews interleaved with activations are all-or-nothing -
+    race = {"codes": []}
+
+    def hammer_reviews():
+        for _ in range(60):
+            c, b = review([aid_ok])
+            # every outcome is either a valid 200 report or a 409 baseline
+            # conflict -- never a partial/500 answer
+            if c == 200:
+                assert b["assessed_count"] == 1 and b["base_revision"] == r1
+                assert b["items"][0]["old_status"] == "ok"
+            else:
+                assert c == 409 and b.get("reason") == "active-moved", b
+            race["codes"].append(c)
+
+    def toggle_activation():
+        for _ in range(15):
+            call("POST", "/v1/rulesets/impact/revisions/%s/activate" % r3,
+                 {"expected_active_revision": r1})
+            call("POST", "/v1/rulesets/impact/revisions/%s/activate" % r1,
+                 {"expected_active_revision": r3})
+
+    th1 = threading.Thread(target=hammer_reviews)
+    th2 = threading.Thread(target=toggle_activation)
+    th1.start(); th2.start(); th1.join(); th2.join()
+    check(
+        "impact: racing reviews are 200-consistent or 409, never partial",
+        set(race["codes"]) <= {200, 409} and 200 in race["codes"],
+        str(sorted(set(race["codes"]))),
+    )
+    # leave the ruleset back on r1 and r1-recorded reviews still working
+    call("POST", "/v1/rulesets/impact/revisions/%s/activate" % r1,
+         {"expected_active_revision": r3})
+    code, body = review([aid_ok, aid_missing, aid_conflict])
+    check("impact: report identical after activation churn",
+          code == 200 and body["report_hash"] == rep["report_hash"])
 
 
 def run_legacy_migration_checks():

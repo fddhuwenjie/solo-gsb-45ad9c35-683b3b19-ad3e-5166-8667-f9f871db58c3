@@ -28,7 +28,7 @@ python3 main.py
 数据持久化在 SQLite（容器内 `/data/app.db`，本地默认 `./data/app.db`，
 环境变量 `APP_DB` 可改）。
 
-自检（启动临时实例跑 330 项端到端检查）：
+自检（启动临时实例跑 434 项端到端检查）：
 
 ```bash
 python3 tests/selftest.py
@@ -45,6 +45,7 @@ python3 tests/selftest.py
 | POST | `/v1/rulesets/{name}/revisions` | 按内容哈希去重生成不可变草稿修订 |
 | GET | `/v1/rulesets/{name}/revisions` | 列出修订历史与激活记录 |
 | POST | `/v1/rulesets/{name}/revisions/{revision}/activate` | CAS 原子激活（回滚同一接口） |
+| POST | `/v1/rulesets/{name}/revisions/{revision}/impact-review` | 发布前影响审查（用目标修订快照重算核算批次） |
 | POST | `/v1/assessments` | 提交核算（幂等） |
 | GET | `/v1/assessments/{id}` | 读取核算结果 |
 | POST | `/v1/assessments/{id}/confirm` | 生成确认版（幂等） |
@@ -172,6 +173,124 @@ curl -sS -X POST "$BASE/v1/rulesets/acme/revisions/r1bbbbbbbbbbbbbb/activate" \
 # 200 {"revision": "r1bbbbbbbbbbbbbb", "active_revision": "r1bbbbbbbbbbbbbb",
 #      "activated": true, "previous_revision": "r3dddddddddddddd", …}
 ```
+
+### 发布前影响审查 `POST /v1/rulesets/{name}/revisions/{revision}/impact-review`
+
+发布草稿（或回滚到旧修订）前，可把**目标修订**应用到一批已持久化核算上
+做影响审查：请求给出规则集名称（路径）、目标修订（路径）、创建草稿时读取
+的活动修订 `base_revision`（规则集首次发布前传 `null`）以及 **1～50 个**
+核算 ID：
+
+```json
+{
+  "base_revision": "r1bbbbbbbbbbbbbb",
+  "assessment_ids": ["45c9821d…", "9be1042a…", "…"]
+}
+```
+
+服务在**同一个 SQLite 读事务**内重读活动修订并确认全部前置条件：
+
+- 目标修订必须是该规则集下已存在的不可变修订（仅草稿也可审查）；
+- 事务内重读的活动修订仍等于 `base_revision`（基线过期返回 **409**
+  `reason: "active-moved"`，附当前活动修订）；
+- 每个核算 ID 都存在；
+- 每个核算都**属于该规则集**（内联规则、其他规则集的核算返回 **409**
+  `reason: "assessment-ruleset-mismatch"`）；
+- 每个核算持久化时记录的修订都**等于该活动修订**
+  （`reason: "assessment-revision-mismatch"`）；目标修订不存在为
+  `unknown-target-revision`、规则集从无任何修订为 `ruleset-not-found`、
+  核算不存在为 `assessment-not-found`（附排序后的非法 ID 列表）。
+
+**任一 ID、修订或基线失效，整体返回 409，绝不产生部分报告。** 审查本身
+完全只读：不新建修订、不写活动指针与审计、不改变任何既有核算。
+
+前置条件全部满足时，每个核算都用其**持久化的规范化请求**对目标修订的
+不可变规则快照重新求值，按**核算 ID 排序**逐项给出：
+
+- `old_status` / `new_status`、`old_summary_hash` / `new_summary_hash`；
+- `old_adopted` / `new_adopted`：采用分支（非 `ok` 状态为 `null`）；
+- `obligation_diff`：制品级义务与逐组件义务的 `added` / `removed`；
+- `regressed`：是否会从放行（`ok`）变为冲突或错误。
+
+顶层 `summary` 汇总**会从放行变为冲突**（`release_to_conflict`）或**变为
+错误**（`release_to_error`，如目标修订删除了某许可证规则导致
+`missing-rules`）的项目、合并列表 `release_to_conflict_or_error` 以及
+全部状态迁移计数。`report_hash` 是规范化响应（不含哈希字段本身）的
+SHA-256：**请求中 ID 的顺序不影响报告内容与 `report_hash`**，重复审查
+逐字节一致。审查一个“当前活动修订自身”也是合法用法（得到全空差异）。
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 以当前活动修订 r1 为基线起草目标修订 r2（草稿不会自动发布）
+R2=$(curl -sS -X POST "$BASE/v1/rulesets/acme/revisions" \
+  -H 'Content-Type: application/json' \
+  -d '{"rules": {"licenses": {"Acme-1.0": {"obligations": ["attribution", "license-text"]}}},
+       "base_revision": "'"$R1"'"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["revision"])')
+
+# 2) 发布前：用 r2 的不可变快照重算这 3 个核算
+curl -sS -X POST "$BASE/v1/rulesets/acme/revisions/$R2/impact-review" \
+  -H 'Content-Type: application/json' \
+  -d "{\"base_revision\": \"$R1\",
+       \"assessment_ids\": [\"$ID1\", \"$ID2\", \"$ID3\"]}"
+```
+
+```json
+{
+  "ruleset": "acme",
+  "target_revision": "a1b2c3d4e5f60718",
+  "base_revision": "r1bbbbbbbbbbbbbb",
+  "assessed_count": 3,
+  "items": [
+    {
+      "assessment_id": "45c9821d…",
+      "old_status": "ok",
+      "new_status": "conflict",
+      "old_summary_hash": "5b4d6f10…",
+      "new_summary_hash": "c023f1aa…",
+      "old_adopted": {"app": "Acme-1.0"},
+      "new_adopted": null,
+      "obligation_diff": {
+        "artifact_obligations": {"added": [], "removed": ["attribution"]},
+        "components": [
+          {"component": "app", "added": [], "removed": ["attribution"]}
+        ]
+      },
+      "regressed": true
+    },
+    { "assessment_id": "9be1042a…", "old_status": "ok", "new_status": "ok",
+      "old_summary_hash": "…", "new_summary_hash": "…",
+      "old_adopted": {"app": "Acme-1.0"}, "new_adopted": {"app": "Acme-1.0"},
+      "obligation_diff": {"artifact_obligations": {"added": [], "removed": []},
+                          "components": []},
+      "regressed": false }
+  ],
+  "summary": {
+    "release_to_conflict": ["45c9821d…"],
+    "release_to_error": [],
+    "release_to_conflict_or_error": ["45c9821d…"],
+    "release_to_conflict_or_error_count": 1,
+    "status_changes": [{"from": "ok", "to": "conflict", "count": 1}],
+    "status_changed_count": 1
+  },
+  "report_hash": "…"
+}
+```
+
+```bash
+# 基线已过期（活动修订在起草后被他人切换）-> 整体 409，无报告
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  "$BASE/v1/rulesets/acme/revisions/$R2/impact-review" \
+  -H 'Content-Type: application/json' \
+  -d "{\"base_revision\": \"$STALE\", \"assessment_ids\": [\"$ID1\"]}"
+# 409 {"reason": "active-moved", "active_revision": "<当前活动修订>", …}
+
+# 批次里混入一个其他规则集的核算 -> 整体 409，无部分报告
+# 409 {"reason": "assessment-ruleset-mismatch", "assessment_ids": ["…"]}
+```
+
+请求信封错误（非对象、缺少/非法 `base_revision`、`assessment_ids` 为空、
+超过 50 个、含重复或非字符串 ID）返回 **400**，与数据库状态无关。
 
 **核算与活动修订**：命名规则集的核算（`POST /v1/assessments`）在单个
 事务内读取**事务开始时的活动修订**、按其规则快照求值，并把该修订 id
@@ -964,15 +1083,16 @@ app/common.py         常量、错误类型、规范化 JSON / 稳定哈希
 app/expression.py     SPDX 风格表达式解析（AND/OR/WITH）
 app/rules.py          默认规则集 + 规则校验规范化
 app/revisions.py      不可变修订标识：规范化内容哈希（修订 id / content_hash）
+app/review.py         发布前影响审查：批次信封校验、用目标修订不可变快照重算核算（旧/新状态、summary_hash、采用分支、义务差异、放行→冲突/错误汇总、report_hash）
 app/solver.py         义务传播、OR 分支选择（穷举 + 分支定界）、冲突检测、确认版生成
 app/fulfillment.py    履约材料核算：义务实例展开、all/any 证据规则（叶子命中按材料集合累积，可由多份材料共同满足）、全局最小集合选择（穷举 + 分支定界）
 app/schedule.py       义务截止日排期：RFC 3339/IANA 时区解析、日历日/工作日偏移、沿无环依赖反向收紧与收紧链还原
 app/responsibility.py 责任分工：责任项展开（制品级/组件级）、人员资格/容量/成本规范化、全局最优分工（穷举 + 最小费用流界的完备分支定界）、409 最佳部分方案与原因
 app/remediation.py   许可证整改：候选表达式/成本校验（非法整体 422）、在持久化快照上重算的全局最优异构组合（穷举 + 完备分支定界，精确有理数成本）、放行方案与 409 唯一最佳失败方案
 app/compare.py        核算对比：原子差异分解（稳定编号）、反事实回滚与全局最小归因集（按大小递增、ID 字典序完备枚举，非法中间状态不计命中）
-app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现
+app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现、影响审查的单读事务前置条件核验
 app/server.py         ThreadingHTTPServer JSON 路由
-tests/selftest.py     330 项端到端自检（含草稿/首版发布门禁、并发发布与回滚）
+tests/selftest.py     434 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查）
 Dockerfile / docker-compose.yml / .dockerignore
 ```
 

@@ -729,6 +729,135 @@ class Store:
             "created_at": row["created_at"],
         }
 
+    def review_impact_inputs(self, name, target_revision, base_revision, ids):
+        """Validate and snapshot one pre-publication impact-review batch.
+
+        Everything stateful is confirmed inside a *single read
+        transaction* (a deferred WAL transaction gives one consistent
+        snapshot for every SELECT):
+
+        1. the target revision exists as immutable content of *name*;
+        2. the active revision, re-read inside the transaction, still
+           equals ``base_revision`` (the revision the caller read when
+           it created the draft);
+        3. every requested assessment exists, belongs to *name* and
+           recorded that active revision.
+
+        Any failure raises ConflictError -- the whole review is refused,
+        no partial report is possible.  On success it returns
+        ``(target_rules, rows)`` where each row carries the assessment's
+        pinned normalized request and persisted result; the caller closes
+        the transaction (by returning) and only then runs the (CPU-bound)
+        re-evaluation.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            active = self._active_row(conn, name)
+            active_rev = active["revision"] if active is not None else None
+
+            target = conn.execute(
+                "SELECT body FROM ruleset_revisions"
+                " WHERE ruleset_name = ? AND revision = ?",
+                (name, target_revision),
+            ).fetchone()
+            if target is None:
+                any_rev = conn.execute(
+                    "SELECT 1 FROM ruleset_revisions WHERE ruleset_name = ?",
+                    (name,),
+                ).fetchone()
+                if any_rev is None:
+                    raise ConflictError(
+                        "ruleset %r has no revisions; target revision %r cannot be "
+                        "reviewed" % (name, target_revision),
+                        {"reason": "ruleset-not-found", "ruleset": name},
+                    )
+                raise ConflictError(
+                    "target revision %r of ruleset %r not found"
+                    % (target_revision, name),
+                    {
+                        "reason": "unknown-target-revision",
+                        "target_revision": target_revision,
+                        "active_revision": active_rev,
+                    },
+                )
+
+            if active_rev != base_revision:
+                raise ConflictError(
+                    "stale base revision for impact review of %r: active revision "
+                    "is %r, review was prepared against %r"
+                    % (name, active_rev, base_revision),
+                    {
+                        "reason": "active-moved",
+                        "base_revision": base_revision,
+                        "active_revision": active_rev,
+                    },
+                )
+
+            placeholders = ",".join("?" for _ in ids)
+            found = {
+                r["id"]: r
+                for r in conn.execute(
+                    "SELECT id, ruleset, revision, request, result"
+                    " FROM assessments WHERE id IN (%s)" % placeholders,
+                    list(ids),
+                ).fetchall()
+            }
+            missing = sorted(aid for aid in ids if aid not in found)
+            if missing:
+                raise ConflictError(
+                    "impact review references unknown assessment ids: %s"
+                    % ", ".join(missing),
+                    {"reason": "assessment-not-found", "assessment_ids": missing},
+                )
+
+            foreign = sorted(
+                aid for aid in ids if found[aid]["ruleset"] != name
+            )
+            if foreign:
+                raise ConflictError(
+                    "impact review accepts only assessments of ruleset %r; these "
+                    "ids belong to another ruleset (or inline rules): %s"
+                    % (name, ", ".join(foreign)),
+                    {
+                        "reason": "assessment-ruleset-mismatch",
+                        "ruleset": name,
+                        "assessment_ids": foreign,
+                    },
+                )
+
+            mismatched = sorted(
+                aid
+                for aid in ids
+                if found[aid]["revision"] != active_rev
+            )
+            if mismatched:
+                raise ConflictError(
+                    "impact review accepts only assessments recorded against the "
+                    "active revision %r of ruleset %r; these ids record another "
+                    "revision: %s"
+                    % (active_rev, name, ", ".join(mismatched)),
+                    {
+                        "reason": "assessment-revision-mismatch",
+                        "active_revision": active_rev,
+                        "assessment_ids": mismatched,
+                    },
+                )
+
+            target_rules = json.loads(target["body"])
+            rows = [
+                {
+                    "id": found[aid]["id"],
+                    "request": json.loads(found[aid]["request"]),
+                    "result": json.loads(found[aid]["result"]),
+                }
+                for aid in ids
+            ]
+            return target_rules, rows
+        finally:
+            conn.rollback()
+            conn.close()
+
     # -- confirmations ----------------------------------------------------
 
     def put_confirmation(self, aid, body):
