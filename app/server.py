@@ -8,6 +8,7 @@ Endpoints:
     POST /v1/rulesets/{name}/revisions
     GET  /v1/rulesets/{name}/revisions
     POST /v1/rulesets/{name}/revisions/{revision}/activate
+    POST /v1/rulesets/{name}/revisions/{revision}/impact-review
     POST /v1/assessments
     GET  /v1/assessments/{id}
     POST /v1/assessments/{id}/confirm
@@ -32,6 +33,7 @@ from .fulfillment import UnprocessableError, check_fulfillment
 from .remediation import RemediationConflict, plan_remediation
 from .responsibility import PartialPlanError, build_plan
 from .revisions import REVISION_ID_LEN
+from .review import review_impacts
 from .rules import validate_ruleset
 from .schedule import build_schedule
 from .solver import assess_normalized, build_confirmation, normalize_request
@@ -40,7 +42,7 @@ MAX_BODY_BYTES = 16 * 1024 * 1024
 _NAME_RE = re.compile(r"^/v1/rulesets(?:/([A-Za-z0-9._-]{1,64}))?$")
 _REVISION_RE = re.compile(
     r"^/v1/rulesets/([A-Za-z0-9._-]{1,64})/revisions"
-    r"(?:/([0-9a-f]{%d})(/activate)?)?$" % REVISION_ID_LEN
+    r"(?:/([0-9a-f]{%d})(/(?:activate|impact-review))?)?$" % REVISION_ID_LEN
 )
 _ASSESS_RE = re.compile(
     r"^/v1/assessments(?:/([0-9a-f]{8,64})"
@@ -123,6 +125,42 @@ class Api:
         if history is None:
             raise NotFound("ruleset %r not found" % name)
         return history
+
+    # -- pre-release impact review ----------------------------------------
+
+    def impact_review(self, name, revision, body):
+        if not isinstance(body, dict):
+            raise ClientError("request body must be a JSON object")
+        if "expected_active_revision" not in body:
+            raise ClientError(
+                "impact review requires 'expected_active_revision'"
+                " (the active revision the draft was created from)"
+            )
+        expected = body["expected_active_revision"]
+        if not (isinstance(expected, str) and expected):
+            raise ClientError("'expected_active_revision' must be a non-empty string")
+        raw_ids = body.get("assessment_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ClientError("assessment_ids must be a non-empty array")
+        if len(raw_ids) > 50:
+            raise ClientError("impact review accepts at most 50 assessment ids")
+        if any(not isinstance(aid, str) or not aid for aid in raw_ids):
+            raise ClientError("assessment_ids must contain non-empty strings")
+        aids = sorted(set(raw_ids))
+        # One read transaction confirms the target revision exists, the
+        # active revision still matches the baseline and every id both
+        # belongs to this ruleset and recorded that active revision.  Any
+        # single failure aborts the whole review (409, no partial report).
+        loaded = self.store.load_impact_review_inputs(
+            name, revision, expected, aids
+        )
+        return review_impacts(
+            name,
+            revision,
+            loaded["active_revision"],
+            loaded["target_rules"],
+            loaded["rows"],
+        )
 
     # -- assessments ------------------------------------------------------
 
@@ -396,6 +434,7 @@ def make_server(host, port, store):
                                 "POST /v1/rulesets/{name}/revisions",
                                 "GET  /v1/rulesets/{name}/revisions",
                                 "POST /v1/rulesets/{name}/revisions/{revision}/activate",
+                                "POST /v1/rulesets/{name}/revisions/{revision}/impact-review",
                                 "POST /v1/assessments",
                                 "GET  /v1/assessments/{id}",
                                 "POST /v1/assessments/{id}/confirm",
@@ -422,6 +461,10 @@ def make_server(host, port, store):
                     if method == "POST" and rev is not None and activate == "/activate":
                         return self._json(
                             200, api.activate_revision(rname, rev, self._body())
+                        )
+                    if method == "POST" and rev is not None and activate == "/impact-review":
+                        return self._json(
+                            200, api.impact_review(rname, rev, self._body())
                         )
 
                 m = _NAME_RE.match(path)

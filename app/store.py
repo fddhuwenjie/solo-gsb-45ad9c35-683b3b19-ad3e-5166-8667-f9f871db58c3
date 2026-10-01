@@ -729,6 +729,105 @@ class Store:
             "created_at": row["created_at"],
         }
 
+    # -- pre-release impact review ----------------------------------------
+
+    def load_impact_review_inputs(self, name, target_revision, expected_active, aids):
+        """Validate and load an impact review from one read snapshot.
+
+        A single deferred (read) transaction -- WAL readers hold one
+        consistent snapshot for its whole duration -- verifies all of:
+
+        1. ``target_revision`` exists as an immutable revision of *name*
+           (a never-drafted name and an unknown revision both fail),
+        2. the ruleset's active revision still matches
+           ``expected_active`` (the revision the draft was created from),
+        3. every requested assessment exists, belongs to *this* ruleset
+           and recorded *this* active revision as the revision it ran
+           with -- legacy/inline rows or accountings produced under an
+           older or newer revision are never reviewed.
+
+        Any failure raises ConflictError (all-or-nothing 409) and the
+        caller produces no partial report.  Nothing is written; the
+        returned rules snapshot and rows are then re-evaluated outside
+        the transaction against a snapshot that cannot change beneath us.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            target = conn.execute(
+                "SELECT body FROM ruleset_revisions"
+                " WHERE ruleset_name = ? AND revision = ?",
+                (name, target_revision),
+            ).fetchone()
+            if target is None:
+                any_rev = conn.execute(
+                    "SELECT 1 FROM ruleset_revisions WHERE ruleset_name = ?",
+                    (name,),
+                ).fetchone()
+                reason = "ruleset-not-found" if any_rev is None else "revision-not-found"
+                raise ConflictError(
+                    "cannot review ruleset %r at revision %r: target revision not found"
+                    % (name, target_revision),
+                    {
+                        "reason": reason,
+                        "ruleset": name,
+                        "target_revision": target_revision,
+                    },
+                )
+            active = self._active_row(conn, name)
+            active_rev = active["revision"] if active is not None else None
+            if active_rev != expected_active:
+                raise ConflictError(
+                    "expected active revision %r but it is %r"
+                    % (expected_active, active_rev),
+                    {
+                        "reason": "active-moved",
+                        "expected_active_revision": expected_active,
+                        "active_revision": active_rev,
+                    },
+                )
+            rows = conn.execute(
+                "SELECT id, ruleset, revision, request, result FROM assessments"
+                " WHERE id IN (%s)" % ",".join("?" for _ in aids),
+                tuple(aids),
+            ).fetchall()
+            found = {r["id"]: r for r in rows}
+            invalid = sorted(
+                aid
+                for aid in aids
+                if (
+                    aid not in found
+                    or found[aid]["ruleset"] != name
+                    or found[aid]["revision"] != active_rev
+                )
+            )
+            if invalid:
+                raise ConflictError(
+                    "impact review only accepts assessments of ruleset %r"
+                    " recorded against active revision %r" % (name, active_rev),
+                    {
+                        "reason": "assessment-mismatch",
+                        "ruleset": name,
+                        "active_revision": active_rev,
+                        "invalid_assessment_ids": invalid,
+                    },
+                )
+            out = {
+                "target_rules": json.loads(target["body"]),
+                "active_revision": active_rev,
+                "rows": [
+                    {
+                        "id": found[aid]["id"],
+                        "request": json.loads(found[aid]["request"]),
+                        "result": json.loads(found[aid]["result"]),
+                    }
+                    for aid in aids
+                ],
+            }
+            return out
+        finally:
+            conn.close()
+
     # -- confirmations ----------------------------------------------------
 
     def put_confirmation(self, aid, body):

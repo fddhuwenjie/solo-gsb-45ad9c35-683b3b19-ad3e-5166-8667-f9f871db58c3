@@ -411,6 +411,9 @@ def run_checks():
     # -- immutable revisions, atomic activation, rollback & concurrency ------
     run_revision_checks()
 
+    # -- draft pre-release impact review ------------------------------------
+    run_impact_review_checks(call, check)
+
     # -- WITH exception removes propagation ----------------------------------
     exc_request = {
         "components": [
@@ -2707,6 +2710,277 @@ def run_compare_checks(call, check):
     code, body = call("GET", "/v1/assessments/%s" % base_id)
     check("compare: baseline assessment unchanged",
           code == 200 and body.get("result", {}).get("summary_hash") == base_hash)
+
+
+def run_impact_review_checks(call, check):
+    """Pre-release impact review of a draft revision.
+
+    Covers: the all-or-nothing read-transaction gate (unknown ruleset /
+    unknown revision / moved active revision / foreign, inline and
+    stale-revision assessments are all 409 with no partial report),
+    request validation (400), old/new status + summary_hash + adopted
+    branches, artifact and per-component obligation diffs, ok->conflict
+    and ok->error regression aggregation, request-order invariance of
+    items and report_hash, idempotent replay equivalence when the target
+    is the active revision, and that reviewing neither publishes the
+    draft nor mutates any assessment.
+    """
+    review = lambda name, rev, expected, ids: call(
+        "POST",
+        "/v1/rulesets/%s/revisions/%s/impact-review" % (name, rev),
+        {"expected_active_revision": expected, "assessment_ids": ids},
+    )
+
+    # r1: three permissive rules (GPL keeps its duties but declares no
+    #     incompatibilities or propagation) -> all fixtures are releasable.
+    # r2 (draft): MIT gains license-text and becomes incompatible with
+    #     GPL-2.0-only (a combined-work conflict for A); Lib-1.0 loses its
+    #     rule entirely (missing-rules error for C); the lone MIT in B
+    #     stays releasable and merely gains an obligation.
+    r1_rules = {
+        "licenses": {
+            "MIT": {"obligations": ["attribution"], "propagates": [],
+                    "incompatible_with": []},
+            "GPL-2.0-only": {"obligations": ["source-offer", "same-license"],
+                             "propagates": [], "incompatible_with": []},
+            "Lib-1.0": {"obligations": ["attribution"], "propagates": [],
+                        "incompatible_with": []},
+        }
+    }
+    r2_rules = {
+        "licenses": {
+            "MIT": {"obligations": ["attribution", "license-text"], "propagates": [],
+                    "incompatible_with": ["GPL-2.0-only"]},
+            "GPL-2.0-only": {"obligations": ["source-offer", "same-license"],
+                             "propagates": [], "incompatible_with": []},
+        }
+    }
+
+    code, body = call("POST", "/v1/rulesets/revimpact/revisions",
+                      {"rules": r1_rules, "base_revision": None})
+    r1 = body.get("revision")
+    check("impact: first revision draft", code == 200 and r1)
+    code, _ = call("POST",
+                   "/v1/rulesets/revimpact/revisions/%s/activate" % r1,
+                   {"expected_active_revision": None})
+    check("impact: first revision published", code == 200)
+    code, body = call("POST", "/v1/rulesets/revimpact/revisions",
+                      {"rules": r2_rules, "base_revision": r1})
+    r2 = body.get("revision")
+    check("impact: second revision is a draft", code == 200 and r2 != r1
+          and body.get("active") is False)
+
+    # A: MIT app statically linked to GPL -> ok under r1, conflict under r2.
+    req_a = {
+        "ruleset": "revimpact",
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "gpl", "license": "GPL-2.0-only", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "app", "to": "gpl"}],
+    }
+    # B: lone MIT -> stays ok, merely gains an obligation.
+    req_b = {"ruleset": "revimpact",
+             "components": [{"id": "solo", "license": "MIT"}]}
+    # C: lone Lib-1.0 -> ok under r1, missing-rules (error) under r2.
+    req_c = {"ruleset": "revimpact",
+             "components": [{"id": "gp2", "license": "Lib-1.0"}]}
+    aids = {}
+    for key, req in (("a", req_a), ("b", req_b), ("c", req_c)):
+        code, body = call("POST", "/v1/assessments", req)
+        check("impact: fixture %s assessed ok under r1" % key,
+              code == 200 and body.get("result", {}).get("status") == "ok"
+              and body.get("ruleset_revision") == r1)
+        aids[key] = body.get("id")
+    a_id, b_id, c_id = aids["a"], aids["b"], aids["c"]
+
+    # -- happy-path report ---------------------------------------------------
+    code, rep = review("revimpact", r2, r1, [a_id, b_id, c_id])
+    check("impact: review 200", code == 200, json.dumps(rep)[:200])
+    check("impact: envelope",
+          rep.get("ruleset") == "revimpact"
+          and rep.get("target_revision") == r2
+          and rep.get("active_revision") == r1
+          and rep.get("assessment_count") == 3
+          and len(rep.get("report_hash", "")) == 64)
+    items = rep.get("items", [])
+    by_id = {i.get("assessment_id"): i for i in items}
+    check("impact: items sorted by assessment id",
+          [i.get("assessment_id") for i in items] == sorted(aids.values()))
+    check("impact: all three changed", all(i.get("changed") for i in items))
+
+    ia = by_id[a_id]
+    check("impact: A ok -> conflict regression",
+          ia["old"]["status"] == "ok" and ia["new"]["status"] == "conflict"
+          and ia["old"]["release"] is True and ia["new"]["release"] is False
+          and ia["new"]["adopted"] is None
+          and ia["old"]["summary_hash"] != ia["new"]["summary_hash"]
+          and set(ia["old"]["adopted"]) == {"app", "gpl"})
+    ib = by_id[b_id]
+    check("impact: B stays ok, obligation added",
+          ib["old"]["status"] == "ok" and ib["new"]["status"] == "ok"
+          and ib["old"]["adopted"] == {"solo": "MIT"}
+          and ib["new"]["adopted"] == {"solo": "MIT"})
+    bd = ib["obligation_diff"]
+    check("impact: B artifact/component obligation diff",
+          bd["artifact"]["added"] == ["license-text"]
+          and bd["artifact"]["removed"] == []
+          and bd["artifact"]["unchanged_count"] == 1
+          and bd["components"] == [
+              {"component": "solo", "added": ["license-text"], "removed": []}])
+    ic = by_id[c_id]
+    check("impact: C ok -> missing-rules error",
+          ic["old"]["status"] == "ok"
+          and ic["new"]["status"] == "missing-rules"
+          and ic["new"]["release"] is False and ic["new"]["adopted"] is None)
+    ad = ia["obligation_diff"]
+    check("impact: A loses release obligations in diff",
+          "source-offer" in ad["artifact"]["removed"]
+          and "same-license" in ad["artifact"]["removed"]
+          and {d["component"] for d in ad["components"]} == {"app", "gpl"})
+
+    summary = rep.get("summary", {})
+    regs = summary.get("release_regressions", {})
+    check("impact: summary counts",
+          summary.get("total") == 3 and summary.get("changed") == 3
+          and summary.get("unchanged") == 0
+          and regs.get("total") == 2
+          and regs.get("to_conflict") == [a_id]
+          and regs.get("to_error") == [c_id]
+          and regs.get("assessment_ids") == sorted([a_id, c_id]))
+    transitions = {(t["from_status"], t["to_status"]): t
+                   for t in summary.get("status_transitions", [])}
+    check("impact: status transition table",
+          transitions[("ok", "conflict")]["assessment_ids"] == [a_id]
+          and transitions[("ok", "missing-rules")]["assessment_ids"] == [c_id]
+          and transitions[("ok", "ok")]["count"] == 1)
+
+    # -- request ordering does not change the report or report_hash ----------
+    code, rep_perm = review("revimpact", r2, r1, [c_id, a_id, b_id, b_id])
+    check("impact: order/dup independent items and report_hash",
+          code == 200 and rep_perm.get("report_hash") == rep.get("report_hash")
+          and rep_perm.get("assessment_count") == 3
+          and [i["assessment_id"] for i in rep_perm["items"]]
+          == [i["assessment_id"] for i in items])
+
+    # -- idempotence: identical request repeats byte-for-byte ----------------
+    code, rep_again = review("revimpact", r2, r1, [a_id, b_id, c_id])
+    check("impact: repeat review identical",
+          code == 200 and rep_again == rep)
+
+    # -- report_hash excludes itself and covers the payload ------------------
+    payload = {k: v for k, v in rep.items() if k != "report_hash"}
+    check("impact: report_hash is hash of payload",
+          rep["report_hash"] == stable_hash(payload))
+
+    # -- all-or-nothing 409 gate --------------------------------------------
+    code, body = review("revimpact", "0" * 16, r1, [a_id])
+    check("impact: unknown target revision -> 409",
+          code == 409 and body.get("reason") == "revision-not-found"
+          and "report_hash" not in body)
+    code, body = review("nope-never-drafted", "0" * 16, r1, [a_id])
+    check("impact: unknown ruleset -> 409",
+          code == 409 and body.get("reason") == "ruleset-not-found")
+    code, body = review("revimpact", r2, "0" * 16, [a_id])
+    check("impact: moved active revision -> 409",
+          code == 409 and body.get("reason") == "active-moved"
+          and body.get("active_revision") == r1
+          and body.get("expected_active_revision") == "0" * 16)
+    code, body = review("revimpact", r2, None, [a_id])
+    check("impact: null baseline -> 400", code == 400)
+
+    # unknown id, foreign ruleset, inline-rule assessment and a mix: one
+    # 409 naming every invalid id, with no partial report
+    unknown_id = "ab" * 16
+    code, foreign = call("PUT", "/v1/rulesets/revimpact-other", r1_rules)
+    code, fbody = call("POST", "/v1/assessments",
+                       {"ruleset": "revimpact-other",
+                        "components": [{"id": "foreign-one",
+                                       "license": "GPL-2.0-only"}]})
+    foreign_id = fbody.get("id")
+    code, ibody = call("POST", "/v1/assessments",
+                       {"rules": validate_ruleset(r1_rules),
+                        "components": [{"id": "inline-one",
+                                       "license": "GPL-2.0-only"}]})
+    inline_id = ibody.get("id")
+    code, body = review("revimpact", r2, r1, [unknown_id])
+    check("impact: unknown assessment -> 409",
+          code == 409 and body.get("reason") == "assessment-mismatch"
+          and body.get("invalid_assessment_ids") == [unknown_id])
+    code, body = review("revimpact", r2, r1, [foreign_id])
+    check("impact: foreign-ruleset assessment -> 409",
+          code == 409 and body.get("invalid_assessment_ids") == [foreign_id])
+    code, body = review("revimpact", r2, r1, [inline_id])
+    check("impact: inline-rule assessment -> 409",
+          code == 409 and body.get("invalid_assessment_ids") == [inline_id])
+    code, body = review("revimpact", r2, r1,
+                        [a_id, unknown_id, foreign_id, inline_id])
+    check("impact: mixed batch is one whole 409, no partial report",
+          code == 409 and body.get("reason") == "assessment-mismatch"
+          and body.get("invalid_assessment_ids")
+          == sorted([unknown_id, foreign_id, inline_id])
+          and a_id not in body.get("invalid_assessment_ids", [])
+          and "report_hash" not in body and "items" not in body)
+
+    # -- request validation -> 400 ------------------------------------------
+    base_path = "/v1/rulesets/revimpact/revisions/%s/impact-review" % r2
+    for label, payload in (
+        ("non-object body", ["nope"]),
+        ("missing expected", {"assessment_ids": [a_id]}),
+        ("empty expected", {"expected_active_revision": "", "assessment_ids": [a_id]}),
+        ("null expected", {"expected_active_revision": None, "assessment_ids": [a_id]}),
+        ("missing ids", {"expected_active_revision": r1}),
+        ("empty ids", {"expected_active_revision": r1, "assessment_ids": []}),
+        ("non-array ids", {"expected_active_revision": r1, "assessment_ids": "x"}),
+        ("non-string id", {"expected_active_revision": r1, "assessment_ids": [1]}),
+        ("empty-string id", {"expected_active_revision": r1, "assessment_ids": [""]}),
+        ("51 ids", {"expected_active_revision": r1, "assessment_ids": [a_id] * 51}),
+    ):
+        code, body = call("POST", base_path, payload)
+        check("impact: %s -> 400" % label, code == 400, json.dumps(body)[:120])
+
+    # -- target == active revision re-evaluates to the stored conclusion -----
+    code, rep_same = review("revimpact", r1, r1, [a_id, b_id, c_id])
+    check("impact: reviewing active revision reproduces stored conclusions",
+          code == 200 and all(
+              i["old"]["summary_hash"] == i["new"]["summary_hash"]
+              and i["changed"] is False for i in rep_same["items"])
+          and rep_same["summary"]["changed"] == 0
+          and rep_same["summary"]["release_regressions"]["total"] == 0
+          and rep_same["items"][0]["new"]["adopted"]
+          == rep_same["items"][0]["old"]["adopted"])
+
+    # -- reviewing neither publishes the draft nor mutates assessments -------
+    code, active = call("GET", "/v1/rulesets/revimpact")
+    check("impact: draft stays unpublished after review",
+          active.get("active_revision") == r1)
+    code, row = call("GET", "/v1/assessments/%s" % a_id)
+    check("impact: assessments not mutated by review",
+          code == 200 and row.get("revision") == r1
+          and row.get("result", {}).get("summary_hash") == ia["old"]["summary_hash"])
+
+    # -- stale revision provenance: after the draft is actually published,
+    #    a row recorded against the old active revision is rejected ----------
+    code, _ = call("POST",
+                   "/v1/rulesets/revimpact/revisions/%s/activate" % r2,
+                   {"expected_active_revision": r1})
+    check("impact: publish r2 for provenance check", code == 200)
+    r3_rules = {
+        "licenses": {
+            "MIT": {"obligations": ["attribution"], "propagates": [],
+                    "incompatible_with": []},
+            "GPL-2.0-only": {"obligations": ["source-offer"], "propagates": [],
+                             "incompatible_with": []},
+        }
+    }
+    code, body = call("POST", "/v1/rulesets/revimpact/revisions",
+                      {"rules": r3_rules, "base_revision": r2})
+    r3 = body.get("revision")
+    code, body = review("revimpact", r3, r2, [a_id, b_id, c_id])
+    check("impact: rows recorded against the old revision -> 409",
+          code == 409 and body.get("reason") == "assessment-mismatch"
+          and body.get("active_revision") == r2
+          and body.get("invalid_assessment_ids") == sorted([a_id, b_id, c_id]))
 
 
 def run_revision_checks():

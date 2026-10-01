@@ -45,6 +45,7 @@ python3 tests/selftest.py
 | POST | `/v1/rulesets/{name}/revisions` | 按内容哈希去重生成不可变草稿修订 |
 | GET | `/v1/rulesets/{name}/revisions` | 列出修订历史与激活记录 |
 | POST | `/v1/rulesets/{name}/revisions/{revision}/activate` | CAS 原子激活（回滚同一接口） |
+| POST | `/v1/rulesets/{name}/revisions/{revision}/impact-review` | 草稿发布前影响审查（只读，按目标修订快照重算既有核算） |
 | POST | `/v1/assessments` | 提交核算（幂等） |
 | GET | `/v1/assessments/{id}` | 读取核算结果 |
 | POST | `/v1/assessments/{id}/confirm` | 生成确认版（幂等） |
@@ -185,6 +186,126 @@ curl -sS -X POST "$BASE/v1/rulesets/acme/revisions/r1bbbbbbbbbbbbbb/activate" \
 （即旧 PUT 写入的内容）原样成为该规则集的**首个活动修订**（修订 id 为
 其内容哈希，`base_revision` 为 `null`），可核验的旧评估记录补盖修订
 id；旧 PUT/GET、既有评估快照与确认版语义全部保持不变。
+
+### 发布前影响审查 `POST /v1/rulesets/{name}/revisions/{revision}/impact-review`
+
+草稿修订激活前，可对**已记录的核算**做一次发布前影响审查：用目标修订的
+**不可变规则快照**对这些核算保存的规范化请求重新求值，逐项给出旧/新
+结论与汇总。请求体给出草稿所依据的活动修订与 1～50 个核算 id：
+
+```json
+{
+  "expected_active_revision": "30fdb169580b966d",
+  "assessment_ids": ["830513a361a8b835e821e10cac3f80c9",
+                     "f042f7eae4107acf7e5b5c11c36e1f39"]
+}
+```
+
+服务在**同一个 SQLite 读事务**（WAL 快照读）内一次性确认：
+
+1. `{revision}` 是该规则集名下存在的不可变修订；
+2. 规则集当前活动修订仍等于 `expected_active_revision`（创建草稿时读取
+   的活动修订）；
+3. 每个核算 id 均存在、**属于该规则集**、且其记录的 `revision` 正是该
+   活动修订。
+
+任一条件不满足都返回 **409 且不产生任何部分报告**：目标修订不存在时
+`reason` 为 `revision-not-found`（名称下从无修订为
+`ruleset-not-found`）；活动修订已移动时为 `active-moved`（附当前活动
+修订）；核算不满足第 3 条（不存在、属于别的规则集、内联规则核算、或
+记录的是更早/更新的修订）时为 `assessment-mismatch`，
+`invalid_assessment_ids` 按 id 序列出**全部**失效项。审查为只读操作：
+**不会发布草稿、不写任何核算**，因此可以安全地反复调用。
+
+响应按核算 id 排序，每项给出旧/新 `status`、是否 `release`、两侧
+`summary_hash`、两侧采用分支（无放行结论的一侧为 `null`），以及义务
+差异（制品级与单组件的 `added` / `removed`）：
+
+```json
+{
+  "ruleset": "acme",
+  "active_revision": "30fdb169580b966d",
+  "target_revision": "94d61e1de317d6f4",
+  "assessment_count": 2,
+  "items": [
+    {
+      "assessment_id": "830513a361a8b835e821e10cac3f80c9",
+      "changed": true,
+      "old": {"status": "ok", "release": true,
+              "summary_hash": "435ffa19…",
+              "adopted": {"x": "MIT"}},
+      "new": {"status": "ok", "release": true,
+              "summary_hash": "de08b7dc…",
+              "adopted": {"x": "MIT"}},
+      "obligation_diff": {
+        "artifact": {"added": ["license-text"], "removed": [],
+                     "unchanged_count": 1},
+        "components": [
+          {"component": "x", "added": ["license-text"], "removed": []}
+        ]
+      }
+    },
+    {
+      "assessment_id": "f042f7eae4107acf7e5b5c11c36e1f39",
+      "changed": true,
+      "old": {"status": "ok", "release": true,
+              "summary_hash": "a0b7bf5f…",
+              "adopted": {"app": "MIT", "g": "GPL-2.0-only"}},
+      "new": {"status": "conflict", "release": false,
+              "summary_hash": "51f67840…", "adopted": null},
+      "obligation_diff": {
+        "artifact": {"added": [],
+                     "removed": ["attribution", "same-license", "source-offer"],
+                     "unchanged_count": 0},
+        "components": [
+          {"component": "app", "added": [], "removed": ["attribution"]},
+          {"component": "g", "added": [],
+           "removed": ["same-license", "source-offer"]}
+        ]
+      }
+    }
+  ],
+  "summary": {
+    "total": 2, "changed": 2, "unchanged": 0,
+    "status_transitions": [
+      {"from_status": "ok", "to_status": "conflict", "count": 1,
+       "assessment_ids": ["f042f7eae4107acf7e5b5c11c36e1f39"]},
+      {"from_status": "ok", "to_status": "ok", "count": 1,
+       "assessment_ids": ["830513a361a8b835e821e10cac3f80c9"]}
+    ],
+    "release_regressions": {
+      "total": 1,
+      "to_conflict": ["f042f7eae4107acf7e5b5c11c36e1f39"],
+      "to_error": [],
+      "assessment_ids": ["f042f7eae4107acf7e5b5c11c36e1f39"]
+    }
+  },
+  "report_hash": "4597052f…"
+}
+```
+
+- `changed` 以两侧 `summary_hash` 是否一致判定；`status_transitions`
+  按 `(from_status, to_status)` 汇总每种状态迁移的核算。
+- `release_regressions` 专门汇总**从放行（`ok`）变为 `conflict` 或错误
+  状态**（`invalid-expression` / `missing-rules` / `dependency-cycle`）
+  的项目：`to_conflict` 与 `to_error` 分别列出，`assessment_ids` 为
+  二者按 id 排序的并集。
+- `report_hash` 是去除该哈希字段后规范报告的 SHA-256。核算 id 去重后
+  统一按 id 排序处理，因此**请求中 id 的顺序（含重复 id）不影响报告
+  内容与 `report_hash`**；同一输入重复审查逐字节一致。
+- 目标修订即当前活动修订时，重算结果与已存结论一致：各项
+  `changed: false`、两侧哈希相同，可作为复演校验。
+- 请求体缺少/误填 `expected_active_revision`（必须为非空字符串）、
+  `assessment_ids` 不是非空数组、元素不是非空字符串或数量超过 50
+  时返回 **400**；修订 id 形态不合法的 URL 返回 404。
+
+```bash
+curl -sS -X POST \
+  "$BASE/v1/rulesets/acme/revisions/$DRAFT_REV/impact-review" \
+  -H 'Content-Type: application/json' \
+  -d "{\"expected_active_revision\": \"$ACTIVE_REV\",
+       \"assessment_ids\": [\"$AID1\", \"$AID2\"]}"
+```
 
 ### 提交核算 `POST /v1/assessments`
 
@@ -964,6 +1085,7 @@ app/common.py         常量、错误类型、规范化 JSON / 稳定哈希
 app/expression.py     SPDX 风格表达式解析（AND/OR/WITH）
 app/rules.py          默认规则集 + 规则校验规范化
 app/revisions.py      不可变修订标识：规范化内容哈希（修订 id / content_hash）
+app/review.py         草稿发布前影响审查：单读事务全有/全无校验、按目标修订不可变快照重算、旧/新状态与义务差异、放行回归汇总、顺序无关 report_hash
 app/solver.py         义务传播、OR 分支选择（穷举 + 分支定界）、冲突检测、确认版生成
 app/fulfillment.py    履约材料核算：义务实例展开、all/any 证据规则（叶子命中按材料集合累积，可由多份材料共同满足）、全局最小集合选择（穷举 + 分支定界）
 app/schedule.py       义务截止日排期：RFC 3339/IANA 时区解析、日历日/工作日偏移、沿无环依赖反向收紧与收紧链还原
@@ -972,7 +1094,7 @@ app/remediation.py   许可证整改：候选表达式/成本校验（非法整�
 app/compare.py        核算对比：原子差异分解（稳定编号）、反事实回滚与全局最小归因集（按大小递增、ID 字典序完备枚举，非法中间状态不计命中）
 app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现
 app/server.py         ThreadingHTTPServer JSON 路由
-tests/selftest.py     330 项端到端自检（含草稿/首版发布门禁、并发发布与回滚）
+tests/selftest.py     373 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查）
 Dockerfile / docker-compose.yml / .dockerignore
 ```
 
